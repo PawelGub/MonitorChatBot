@@ -304,7 +304,48 @@ async def status_command(client, message: Message):
     await message.reply(status_text)
 
 if __name__ == "__main__":
-    print("🚀 MonitorChatBot с DeepSeek запущен...")
+    import asyncio
+    import os
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    print("🚀 MonitorChatBot с DeepSeek запускается на Render...")
     print(f"📝 Бот: @MonitorChatBot")
     print(f"🤖 DeepSeek: {'✅ подключен' if DEEPSEEK_API_KEY else '❌ НЕТ КЛЮЧА!'}")
-    app.run()
+
+    # 1. СОЗДАЁМ НОВЫЙ ЦИКЛ СОБЫТИЙ и делаем его текущим
+    # Это критически важно для Pyrogram в такой среде!
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # 2. Функция для запуска бота в отдельном потоке, используя наш цикл
+    def run_bot():
+        # Устанавливаем созданный цикл для этого потока
+        asyncio.set_event_loop(loop)
+        # Запускаем клиента Pyrogram
+        app.run()
+
+    # 3. Запускаем бота в фоновом потоке
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+
+    # 4. Запускаем простой HTTP-сервер для health checks от Render
+    # Render требует, чтобы сервис слушал порт, иначе он будет думать, что приложение не запустилось
+    class HealthCheckHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is running")
+
+    # Render сам назначает порт через переменную окружения PORT
+    port = int(os.environ.get("PORT", 10000))
+    server_address = ('0.0.0.0', port)
+    httpd = HTTPServer(server_address, HealthCheckHandler)
+    print(f"✅ Health check server listening on port {port}")
+
+    # 5. Запускаем HTTP-сервер в основном потоке
+    # Это не даст скрипту завершиться
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("🛑 Shutting down...")
