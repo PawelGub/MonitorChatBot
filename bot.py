@@ -8,6 +8,7 @@ from datetime import datetime, date
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 import openai
+from flask import Flask, request
 
 # Настройка логирования
 logging.basicConfig(
@@ -35,50 +36,54 @@ message_store = defaultdict(list)
 MAX_MESSAGES_PER_CHAT = 5000
 
 # ============================================
-# ФУНКЦИЯ ЗАПУСКА БОТА (ВСЯ ЛОГИКА ЗДЕСЬ)
+# Flask приложение для вебхуков
 # ============================================
-def run_bot():
-    """Запуск бота с собственным циклом событий"""
+webhook_app = Flask(__name__)
+bot_instance = None  # Сюда сохраним клиента
+loop_instance = None  # Сюда сохраним цикл событий
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+@webhook_app.route('/', methods=['POST'])
+def webhook():
+    """Обработчик входящих обновлений от Telegram"""
+    global bot_instance, loop_instance
+    if bot_instance and loop_instance:
+        update = request.get_json()
+        asyncio.run_coroutine_threadsafe(
+            bot_instance.handle_update(update),
+            loop_instance
+        )
+    return "OK", 200
 
-    from pyrogram import Client, filters, enums, idle
+@webhook_app.route('/')
+def health():
+    return "Bot is running", 200
+
+# ============================================
+# Функция запуска бота
+# ============================================
+def start_bot():
+    global bot_instance, loop_instance
+
+    # Создаем цикл событий
+    loop_instance = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop_instance)
+
+    # Импортируем Pyrogram
+    from pyrogram import Client, filters, enums
     from pyrogram.types import Message
 
-    # ========== ПРИНУДИТЕЛЬНОЕ УДАЛЕНИЕ ВЕБХУКА ==========
-    async def force_delete_webhook():
-        temp_client = Client(
-            "webhook_cleaner",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            bot_token=BOT_TOKEN,
-            in_memory=True  # Не сохраняем сессию
-        )
-        try:
-            await temp_client.start()
-            await temp_client.delete_webhook()
-            print("✅ Вебхук успешно удален")
-            await temp_client.stop()
-        except Exception as e:
-            print(f"⚠️ Ошибка при удалении вебхука: {e}")
-
-    loop.run_until_complete(force_delete_webhook())
-    # ====================================================
-
-    # Теперь создаем основного клиента
-    app = Client(
+    # Создаем клиента
+    bot_instance = Client(
         "monitor_chat_bot",
         api_id=API_ID,
         api_hash=API_HASH,
         bot_token=BOT_TOKEN
     )
 
-    # ========== ОБРАБОТЧИКИ КОМАНД ==========
+    # ========== ВСЕ ОБРАБОТЧИКИ ==========
 
-    @app.on_message(filters.text & ~filters.bot)
+    @bot_instance.on_message(filters.text & ~filters.bot)
     async def store_message(client, message: Message):
-        """Сохраняем каждое входящее текстовое сообщение"""
         try:
             chat_id = message.chat.id
 
@@ -113,7 +118,7 @@ def run_bot():
         except Exception as e:
             logger.error(f"Ошибка сохранения: {e}")
 
-    @app.on_message(filters.command("start"))
+    @bot_instance.on_message(filters.command("start"))
     async def start_command(client, message: Message):
         await message.reply(
             "👋 Привет! Я **MonitorChatBot** — анализатор чатов с AI\n\n"
@@ -124,7 +129,7 @@ def run_bot():
             "/help - помощь"
         )
 
-    @app.on_message(filters.command("help"))
+    @bot_instance.on_message(filters.command("help"))
     async def help_command(client, message: Message):
         help_text = """
 🤖 **MonitorChatBot — Команды**
@@ -143,7 +148,7 @@ def run_bot():
         """
         await message.reply(help_text)
 
-    @app.on_message(filters.command("digest"))
+    @bot_instance.on_message(filters.command("digest"))
     async def digest_command(client, message: Message):
         chat_id = message.chat.id
         await client.send_chat_action(chat_id, enums.ChatAction.TYPING)
@@ -215,7 +220,7 @@ def run_bot():
             logger.error(f"Ошибка DeepSeek: {e}")
             await message.reply("❌ Ошибка AI")
 
-    @app.on_message(filters.command("stats"))
+    @bot_instance.on_message(filters.command("stats"))
     async def stats_command(client, message: Message):
         chat_id = message.chat.id
         await client.send_chat_action(chat_id, enums.ChatAction.TYPING)
@@ -244,7 +249,7 @@ def run_bot():
 
         await message.reply(report)
 
-    @app.on_message(filters.command("last"))
+    @bot_instance.on_message(filters.command("last"))
     async def last_command(client, message: Message):
         if len(message.command) < 2:
             await message.reply("❌ Укажи: `/last @username`")
@@ -275,7 +280,7 @@ def run_bot():
 
         await message.reply(report)
 
-    @app.on_message(filters.command("clear"))
+    @bot_instance.on_message(filters.command("clear"))
     async def clear_command(client, message: Message):
         chat_id = message.chat.id
         if chat_id in message_store:
@@ -285,7 +290,7 @@ def run_bot():
         else:
             await message.reply("❌ Нет сообщений")
 
-    @app.on_message(filters.command("status"))
+    @bot_instance.on_message(filters.command("status"))
     async def status_command(client, message: Message):
         chat_id = message.chat.id
         today_count = len([m for m in message_store.get(chat_id, [])
@@ -301,98 +306,31 @@ def run_bot():
         await message.reply(status)
 
     # ========== ЗАПУСК ==========
-    print("🤖 Бот запускается...")
+    async def start_and_set_webhook():
+        await bot_instance.start()
+        # Устанавливаем вебхук
+        webhook_url = "https://monitorchatbot.onrender.com/"
+        await bot_instance.set_webhook(webhook_url)
+        print(f"✅ Вебхук установлен на {webhook_url}")
+        print("✅ Бот запущен и слушает сообщения через вебхук")
 
-    async def start_bot():
-        await app.start()
-        print("✅ Бот запущен и слушает сообщения")
-        # Используем стандартный метод Pyrogram
-        await idle()
+        # Держим бота живым
+        while True:
+            await asyncio.sleep(60)
 
-    try:
-        loop.run_until_complete(start_bot())
-    except KeyboardInterrupt:
-        loop.run_until_complete(app.stop())
-    finally:
-        loop.close()
+    loop_instance.run_until_complete(start_and_set_webhook())
 
 # ============================================
 # ТОЧКА ВХОДА
 # ============================================
 if __name__ == "__main__":
-    import os
-    from flask import Flask, request
-    import threading
-    import asyncio
-
     print("🚀 MonitorChatBot на Render (вебхук режим)")
     print(f"🤖 DeepSeek: {'✅' if DEEPSEEK_API_KEY else '❌'}")
 
-    # Создаем Flask приложение для вебхука
-    webhook_app = Flask(__name__)
-
-    # Глобальная переменная для клиента Pyrogram
-    bot_client = None
-    loop = None
-
-    @webhook_app.route('/', methods=['POST'])
-    def webhook():
-        """Обработчик входящих обновлений от Telegram"""
-        if bot_client and loop:
-            update = request.get_json()
-            # Запускаем обработку в правильном цикле событий
-            asyncio.run_coroutine_threadsafe(
-                bot_client.handle_update(update),
-                loop
-            )
-        return "OK", 200
-
-    @webhook_app.route('/')
-    def health():
-        return "Bot is running", 200
-
-    # Функция для запуска бота в фоне
-    def start_bot_in_thread():
-        nonlocal bot_client, loop
-
-        # Создаем новый цикл событий
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        # Импортируем Pyrogram
-        from pyrogram import Client, filters, enums
-        from pyrogram.types import Message
-
-        # Создаем клиента (без запуска)
-        bot_client = Client(
-            "monitor_chat_bot",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            bot_token=BOT_TOKEN
-        )
-
-        # 👇 ВСЕ ТВОИ ОБРАБОТЧИКИ ДОЛЖНЫ БЫТЬ ЗДЕСЬ
-        # Просто скопируй сюда все @bot_client.on_message из функции run_bot()
-        # (весь код обработчиков, который был внутри run_bot)
-
-        async def start_and_set_webhook():
-            await bot_client.start()
-
-            # Устанавливаем вебхук на URL Render
-            webhook_url = "https://monitorchatbot.onrender.com/"
-            await bot_client.set_webhook(webhook_url)
-            print(f"✅ Вебхук установлен на {webhook_url}")
-
-            # Держим бота живым
-            while True:
-                await asyncio.sleep(60)
-
-        loop.run_until_complete(start_and_set_webhook())
-
     # Запускаем бота в отдельном потоке
-    bot_thread = threading.Thread(target=start_bot_in_thread, daemon=True)
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
     bot_thread.start()
 
-    # Запускаем Flask сервер (он будет принимать вебхуки)
+    # Запускаем Flask сервер
     port = int(os.environ.get("PORT", 10000))
     webhook_app.run(host='0.0.0.0', port=port)
