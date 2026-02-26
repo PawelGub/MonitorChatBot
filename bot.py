@@ -320,29 +320,79 @@ def run_bot():
 # ТОЧКА ВХОДА
 # ============================================
 if __name__ == "__main__":
-    print("🚀 MonitorChatBot на Render")
+    import os
+    from flask import Flask, request
+    import threading
+    import asyncio
+
+    print("🚀 MonitorChatBot на Render (вебхук режим)")
     print(f"🤖 DeepSeek: {'✅' if DEEPSEEK_API_KEY else '❌'}")
 
+    # Создаем Flask приложение для вебхука
+    webhook_app = Flask(__name__)
+
+    # Глобальная переменная для клиента Pyrogram
+    bot_client = None
+    loop = None
+
+    @webhook_app.route('/', methods=['POST'])
+    def webhook():
+        """Обработчик входящих обновлений от Telegram"""
+        if bot_client and loop:
+            update = request.get_json()
+            # Запускаем обработку в правильном цикле событий
+            asyncio.run_coroutine_threadsafe(
+                bot_client.handle_update(update),
+                loop
+            )
+        return "OK", 200
+
+    @webhook_app.route('/')
+    def health():
+        return "Bot is running", 200
+
+    # Функция для запуска бота в фоне
+    def start_bot_in_thread():
+        nonlocal bot_client, loop
+
+        # Создаем новый цикл событий
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # Импортируем Pyrogram
+        from pyrogram import Client, filters, enums
+        from pyrogram.types import Message
+
+        # Создаем клиента (без запуска)
+        bot_client = Client(
+            "monitor_chat_bot",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN
+        )
+
+        # 👇 ВСЕ ТВОИ ОБРАБОТЧИКИ ДОЛЖНЫ БЫТЬ ЗДЕСЬ
+        # Просто скопируй сюда все @bot_client.on_message из функции run_bot()
+        # (весь код обработчиков, который был внутри run_bot)
+
+        async def start_and_set_webhook():
+            await bot_client.start()
+
+            # Устанавливаем вебхук на URL Render
+            webhook_url = "https://monitorchatbot.onrender.com/"
+            await bot_client.set_webhook(webhook_url)
+            print(f"✅ Вебхук установлен на {webhook_url}")
+
+            # Держим бота живым
+            while True:
+                await asyncio.sleep(60)
+
+        loop.run_until_complete(start_and_set_webhook())
+
     # Запускаем бота в отдельном потоке
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread = threading.Thread(target=start_bot_in_thread, daemon=True)
     bot_thread.start()
 
-    # HTTP-сервер для Render
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Bot is running")
-
-        def log_message(self, *args):
-            pass
-
+    # Запускаем Flask сервер (он будет принимать вебхуки)
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    print(f"✅ Health check on port {port}")
-    print("📝 Бот: @MonitorChatBot")
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("🛑 Остановка")
+    webhook_app.run(host='0.0.0.0', port=port)
