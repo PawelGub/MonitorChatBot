@@ -307,9 +307,8 @@ def run_bot():
     async def start_bot():
         await app.start()
         print("✅ Бот запущен и слушает сообщения")
-        # Бесконечно держим соединение
-        while True:
-            await asyncio.sleep(3600)  # спим час
+        # Бесконечное ожидание, чтобы бот не завершился
+        await asyncio.Event().wait()
 
     try:
         loop.run_until_complete(start_bot())
