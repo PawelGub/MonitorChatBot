@@ -307,8 +307,8 @@ def run_bot():
     async def start_bot():
         await app.start()
         print("✅ Бот запущен и слушает сообщения")
-        # Бесконечное ожидание, чтобы бот не завершился
-        await asyncio.Event().wait()
+        # Используем стандартный метод Pyrogram
+        await idle()
 
     try:
         loop.run_until_complete(start_bot())
