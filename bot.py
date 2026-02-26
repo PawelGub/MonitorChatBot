@@ -45,7 +45,7 @@ def run_bot():
     asyncio.set_event_loop(loop)
 
     # Импортируем Pyrogram ТОЛЬКО здесь, внутри потока
-    from pyrogram import Client, filters, enums
+    from pyrogram import Client, filters, enums, idle
     from pyrogram.types import Message
 
     # ========== СБРОС WEBHOOK ==========
