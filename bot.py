@@ -32,8 +32,8 @@ openrouter_client = openai.OpenAI(
 message_store = defaultdict(list)
 digest_cache = {}  # {chat_id: {"last_msg_id": int, "digest": str, "date": date}}
 
-# Конфигурация
-FREE_MODEL = "liquid/lfm-2.5-1.2b-instruct:free"  # Рабочая бесплатная модель
+# 👇 ПОБЕДИТЕЛЬ - лучшая бесплатная модель
+FREE_MODEL = "arcee-ai/trinity-large-preview:free"
 MAX_MESSAGES = 2000
 
 def send_message(chat_id, text):
@@ -54,8 +54,8 @@ def call_free_ai(prompt, system_prompt="Ты полезный ассистент
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.7,
-            max_tokens=800
+            temperature=0.3,  # Понижаем для более структурированных ответов
+            max_tokens=1000
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -110,7 +110,6 @@ def webhook():
             }
             message_store[chat_id].append(msg_data)
 
-            # Ограничиваем хранилище
             if len(message_store[chat_id]) > MAX_MESSAGES:
                 message_store[chat_id] = message_store[chat_id][-MAX_MESSAGES:]
 
@@ -132,7 +131,7 @@ def webhook():
 • `/clearcache` - сбросить кэш дайджеста
 • `/status` - статус бота
 
-**AI модель:** Liquid LFM 2.5 (бесплатно)
+**AI модель:** Trinity Large Preview (бесплатно, умная)
                 """
                 send_message(chat_id, help_text)
 
@@ -143,7 +142,7 @@ def webhook():
                          f"• Сообщений сегодня: {today_count}\n" \
                          f"• Всего сохранено: {len(message_store[chat_id])}\n" \
                          f"• Кэш дайджеста: {'✅' if cached else '❌'}\n" \
-                         f"• AI: Liquid LFM 2.5 (бесплатно)"
+                         f"• AI: Trinity Large (бесплатно)"
                 send_message(chat_id, status)
 
             elif text == '/clearcache':
@@ -182,9 +181,12 @@ def webhook():
                     send_message(chat_id, "⚠️ Слишком мало сообщений за сегодня (меньше 3)")
                     return 'OK', 200
 
-                # Проверяем кэш
                 last_msg_id = today_msgs[-1]['message_id']
                 cached = digest_cache.get(chat_id)
+
+                # Собираем все реальные имена
+                real_names = {msg['user_name'] for msg in today_msgs}
+                names_list = ', '.join(real_names)
 
                 if cached and cached['date'] == today:
                     new_msgs = [m for m in today_msgs if m['message_id'] > cached['last_msg_id']]
@@ -195,33 +197,29 @@ def webhook():
 
                     new_text = "\n".join([f"{m['user_name']}: {m['text']}" for m in new_msgs])
 
-                    # 👇 ОБНОВЛЕННЫЙ ПРОМПТ ДЛЯ ОБНОВЛЕНИЯ
-                    prompt = f"""Слушай, у нас тут чат. Вот текущий дайджест, а вот новые сообщения.
+                    prompt = f"""Обнови существующий дайджест с учетом новых сообщений.
 
-Текущий дайджест (может быть кривым):
+Сегодня писали: {names_list}
+
+Текущий дайджест:
 {cached['digest']}
 
-Новые сообщения (добавь их в дайджест):
+Новые сообщения:
 {new_text}
 
-Твоя задача - обновить дайджест. Правила:
-1. Указывай ТОЛЬКО реальные имена, которые есть в сообщениях. Никаких "Имя1", "Участник2" - только те, кто реально писал.
-2. Будь пассивно-агрессивным. Как будто тебя задолбали, но ты все равно делаешь свою работу.
-3. Если тема очевидна - напиши ее, если нет - так и скажи.
-
-Формат JSON (строго):
+Верни ОБНОВЛЕННЫЙ JSON в том же формате:
 {{
-    "summary": "общее резюме дня (язвительно, но по делу)",
+    "summary": "общее резюме дня (честно, без прикрас)",
     "topics": [
         {{
-            "topic": "название темы",
-            "participants": ["Имя1", "Имя2"],  # Только те, кто реально писал в этой теме
-            "key_points": "суть темы (саркастично)"
+            "topic": "тема",
+            "participants": ["Имя"],  # Только реальные участники из списка выше
+            "key_points": "суть"
         }}
     ]
 }}"""
 
-                    system = "Ты уставший аналитик чата. Отвечаешь пассивно-агрессивно, но честно. JSON только."
+                    system = "Ты аналитик чата. Обновляй дайджест. Только реальные имена."
 
                 else:
                     messages_text = "\n".join([
@@ -229,31 +227,36 @@ def webhook():
                         for msg in today_msgs[-30:]
                     ])
 
-                    # 👇 ОБНОВЛЕННЫЙ ПРОМПТ ДЛЯ НОВОГО ДАЙДЖЕСТА
-                    prompt = f"""О, еще один день, еще один чат. Разбирай.
+                    prompt = f"""Проанализируй сообщения за сегодня.
 
-Сообщения за сегодня:
+Сегодня писали: {names_list}
+
+Сообщения:
 {messages_text}
 
-Правила:
-1. Указывай ТОЛЬКО реальные имена участников. Проверь, кто реально писал в каждой теме.
-2. Тон - пассивно-агрессивный. Как будто тебе платят копейки, но ты все равно работаешь.
-3. Если кто-то пишет чушь - отметь это в резюме.
-4. Никаких выдуманных участников. Если в теме писал только Павел - в participants только ["Pawel"].
-
-Формат JSON:
+Верни JSON:
 {{
-    "summary": "общее резюме дня (с подколом)",
+    "summary": "общее резюме дня (одно предложение, честно)",
     "topics": [
         {{
-            "topic": "о чем базарили",
-            "participants": ["Имя"],  # Только реальные имена
-            "key_points": "суть (саркастично)"
+            "topic": "тема 1",
+            "participants": ["Имя1"],  # Только из списка {names_list}
+            "key_points": "что сказано"
+        }},
+        {{
+            "topic": "тема 2", 
+            "participants": ["Имя2"],
+            "key_points": "что сказано"
         }}
     ]
-}}"""
+}}
 
-                    system = "Ты ворчливый аналитик чата. JSON строго, имена только реальные."
+Правила:
+- Участники ТОЛЬКО из списка: {names_list}
+- Если кто-то писал ерунду - отметь это
+- Будь честным, но не выдумывай"""
+
+                    system = "Ты аналитик чата. Отвечай JSON. Только реальные имена."
 
                 response_content = call_free_ai(prompt, system)
 
@@ -267,18 +270,14 @@ def webhook():
                     send_message(chat_id, "❌ Ошибка при обработке ответа AI. Попробуй позже.")
                     return 'OK', 200
 
-                # 👇 ФИЛЬТРУЕМ УЧАСТНИКОВ (на всякий случай)
-                # Собираем все реальные имена за сегодня
-                real_names = {msg['user_name'] for msg in today_msgs}
-
-                # Чистим topics от выдуманных участников
+                # Чистим участников
                 if 'topics' in result:
                     for topic in result['topics']:
                         if 'participants' in topic:
                             # Оставляем только реальные имена
                             topic['participants'] = [p for p in topic['participants'] if p in real_names]
                             if not topic['participants']:
-                                topic['participants'] = ["неизвестно кто"]  # на всякий случай
+                                topic['participants'] = list(real_names) or ["кто-то"]
 
                 digest = f"📅 **Дайджест за {today.strftime('%d.%m.%Y')}**\n\n"
                 digest += f"📝 **Резюме:**\n{result.get('summary', 'Нет резюме')}\n\n"
@@ -286,7 +285,7 @@ def webhook():
 
                 for i, topic in enumerate(result.get('topics', []), 1):
                     digest += f"\n{i}. **{topic.get('topic', 'Тема')}**\n"
-                    digest += f"   👥 Кто: {', '.join(topic.get('participants', ['-']))}\n"
+                    digest += f"   👥 {', '.join(topic.get('participants', ['-']))}\n"
                     digest += f"   💭 {topic.get('key_points', '')}\n"
 
                 digest += f"\n📊 Проанализировано сообщений: {len(today_msgs)}"
@@ -311,10 +310,9 @@ def health():
 
 @app.route('/')
 def home():
-    return 'Bot is running with Liquid LFM 2.5 (free AI)!', 200
+    return f'Bot is running with {FREE_MODEL}!', 200
 
 def set_webhook():
-    """Установка вебхука"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     webhook_url = "https://monitorchatbot.onrender.com/"
     response = requests.post(url, json={'url': webhook_url})
@@ -324,8 +322,8 @@ def set_webhook():
         print(f"❌ Ошибка установки вебхука: {response.json()}")
 
 if __name__ == "__main__":
-    print("🚀 MonitorChatBot с БЕСПЛАТНЫМ AI (Liquid LFM 2.5) запускается...")
-    print(f"🤖 Модель: {FREE_MODEL}")
+    print(f"🚀 MonitorChatBot с БЕСПЛАТНЫМ AI ({FREE_MODEL}) запускается...")
+    print("🤖 Модель: Trinity Large Preview (умная, бесплатная)")
 
     set_webhook()
 
