@@ -1,0 +1,4 @@
+pyrogram==2.0.106
+python-dotenv==1.0.0
+openai==2.24.0
+tiktoken==0.12.0
