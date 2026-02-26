@@ -40,34 +40,33 @@ MAX_MESSAGES_PER_CHAT = 5000
 def run_bot():
     """Запуск бота с собственным циклом событий"""
 
-    # Создаем новый цикл событий для этого потока
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Импортируем Pyrogram ТОЛЬКО здесь, внутри потока
     from pyrogram import Client, filters, enums, idle
     from pyrogram.types import Message
 
-    # ========== СБРОС WEBHOOK ==========
-    async def delete_webhook():
-        """Удаляем webhook, чтобы работал поллинг"""
+    # ========== ПРИНУДИТЕЛЬНОЕ УДАЛЕНИЕ ВЕБХУКА ==========
+    async def force_delete_webhook():
         temp_client = Client(
-            "temp_webhook",
+            "webhook_cleaner",
             api_id=API_ID,
             api_hash=API_HASH,
-            bot_token=BOT_TOKEN
+            bot_token=BOT_TOKEN,
+            in_memory=True  # Не сохраняем сессию
         )
         try:
             await temp_client.start()
             await temp_client.delete_webhook()
+            print("✅ Вебхук успешно удален")
             await temp_client.stop()
-            print("✅ Webhook удален")
         except Exception as e:
-            print(f"⚠️ Ошибка при удалении webhook: {e}")
+            print(f"⚠️ Ошибка при удалении вебхука: {e}")
 
-    loop.run_until_complete(delete_webhook())
+    loop.run_until_complete(force_delete_webhook())
+    # ====================================================
 
-    # ========== СОЗДАНИЕ КЛИЕНТА ==========
+    # Теперь создаем основного клиента
     app = Client(
         "monitor_chat_bot",
         api_id=API_ID,
