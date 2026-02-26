@@ -9,6 +9,8 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 import openai
 
+import asyncio
+asyncio.set_event_loop(asyncio.new_event_loop())
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
