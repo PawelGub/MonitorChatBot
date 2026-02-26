@@ -16,24 +16,28 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')  # Может быть пустым для бесплатного режима
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 
-# Настройка OpenRouter клиента (бесплатный)
+# Настройка OpenRouter клиента
 openrouter_client = openai.OpenAI(
-    api_key=OPENROUTER_API_KEY or "not-needed",  # OpenRouter позволяет без ключа для free моделей [citation:6]
+    api_key=OPENROUTER_API_KEY,
     base_url="https://openrouter.ai/api/v1",
     default_headers={
-        "HTTP-Referer": "https://monitorchatbot.onrender.com",  # Твой сайт
-        "X-Title": "MonitorChatBot"  # Название проекта
+        "HTTP-Referer": "https://monitorchatbot.onrender.com",
+        "X-Title": "MonitorChatBot"
     }
 )
 
-# Хранилище сообщений и кэша дайджестов
+# Хранилище сообщений и кэша
 message_store = defaultdict(list)
 digest_cache = {}  # {chat_id: {"last_msg_id": int, "digest": str, "date": date}}
 
-# Функция для отправки ответов в Telegram
+# Конфигурация
+FREE_MODEL = "liquid/lfm-2.5-1.2b-instruct:free"  # Рабочая бесплатная модель
+MAX_MESSAGES = 2000
+
 def send_message(chat_id, text):
+    """Отправка сообщения в Telegram"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     requests.post(url, json={
         'chat_id': chat_id,
@@ -41,29 +45,29 @@ def send_message(chat_id, text):
         'parse_mode': 'Markdown'
     })
 
-# Функция для вызова OpenRouter с бесплатными моделями [citation:6]
 def call_free_ai(prompt, system_prompt="Ты полезный ассистент."):
+    """Вызов бесплатной AI модели"""
     try:
         response = openrouter_client.chat.completions.create(
-            model="deepseek/deepseek-chat:free",  # Бесплатная модель
+            model=FREE_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
-            max_tokens=1000
+            max_tokens=800
         )
         return response.choices[0].message.content
     except Exception as e:
-        logger.error(f"Ошибка OpenRouter: {e}")
+        logger.error(f"Ошибка AI: {e}")
         return None
 
-# Функция для парсинга JSON из ответа
 def parse_json_response(content):
+    """Парсинг JSON из ответа AI"""
     if not content:
         return None
     try:
-        # Очищаем от markdown-оберток
+        # Очищаем от возможных markdown-оберток
         content = content.strip()
         if content.startswith('```json'):
             content = content[7:]
@@ -75,15 +79,15 @@ def parse_json_response(content):
 
         return json.loads(content)
     except json.JSONDecodeError as e:
-        logger.error(f"Ошибка парсинга JSON: {e}, контент: {content[:200]}")
+        logger.error(f"Ошибка парсинга JSON: {e}")
         return None
 
-# Создаем Flask приложение
+# Flask приложение
 app = Flask(__name__)
 
 @app.route('/', methods=['POST'])
 def webhook():
-    """Принимаем обновления от Telegram"""
+    """Обработчик вебхука"""
     try:
         update = request.get_json()
 
@@ -94,7 +98,7 @@ def webhook():
             user = msg['from']
             user_name = user.get('first_name', '')
             username = user.get('username', '')
-            message_id = msg['message_id']  # Важно для кэша
+            message_id = msg['message_id']
 
             # Сохраняем сообщение
             msg_data = {
@@ -106,32 +110,40 @@ def webhook():
             }
             message_store[chat_id].append(msg_data)
 
-            # Ограничиваем размер хранилища (последние 2000 сообщений)
-            if len(message_store[chat_id]) > 2000:
-                message_store[chat_id] = message_store[chat_id][-2000:]
+            # Ограничиваем хранилище
+            if len(message_store[chat_id]) > MAX_MESSAGES:
+                message_store[chat_id] = message_store[chat_id][-MAX_MESSAGES:]
 
-            # Обрабатываем команды
+            # Обработка команд
             if text == '/start':
-                send_message(chat_id, "👋 Привет! Я MonitorChatBot с **бесплатным AI**\n\nКоманды:\n/stats - статистика\n/digest - умный дайджест за сегодня (с кэшем)\n/clearcache - сбросить кэш дайджеста\n/help - помощь")
+                send_message(chat_id, "👋 Привет! Я MonitorChatBot с **бесплатным AI**\n\n"
+                                      "Команды:\n"
+                                      "/stats - статистика\n"
+                                      "/digest - дайджест за сегодня\n"
+                                      "/clearcache - сбросить кэш\n"
+                                      "/help - помощь")
 
             elif text == '/help':
                 help_text = """
-🤖 **MonitorChatBot — Бесплатный AI**
+🤖 **MonitorChatBot — Команды**
 
 • `/stats` - статистика по последним 100 сообщениям
-• `/digest` - **умный дайджест** (кэшируется, обновляется только новыми сообщениями)
-• `/clearcache` - сбросить кэш дайджеста (если хочешь перегенерировать с нуля)
+• `/digest` - **дайджест за сегодня** (с кэшированием)
+• `/clearcache` - сбросить кэш дайджеста
 • `/status` - статус бота
 
-**AI:** OpenRouter (бесплатные модели DeepSeek)
-**Кэш:** дайджест хранится и обновляется только новыми сообщениями
+**AI модель:** Liquid LFM 2.5 (бесплатно)
                 """
                 send_message(chat_id, help_text)
 
             elif text == '/status':
                 today_count = len([m for m in message_store[chat_id] if m['date'].date() == date.today()])
                 cached = chat_id in digest_cache and digest_cache[chat_id]['date'] == date.today()
-                status = f"📊 **Статус**\n• Сообщений сегодня: {today_count}\n• Всего сохранено: {len(message_store[chat_id])}\n• Кэш дайджеста: {'✅' if cached else '❌'}\n• AI: бесплатный OpenRouter"
+                status = f"📊 **Статус**\n" \
+                         f"• Сообщений сегодня: {today_count}\n" \
+                         f"• Всего сохранено: {len(message_store[chat_id])}\n" \
+                         f"• Кэш дайджеста: {'✅' if cached else '❌'}\n" \
+                         f"• AI: Liquid LFM 2.5 (бесплатно)"
                 send_message(chat_id, status)
 
             elif text == '/clearcache':
@@ -166,25 +178,23 @@ def webhook():
                 today = date.today()
                 today_msgs = [m for m in message_store[chat_id] if m['date'].date() == today]
 
-                if len(today_msgs) < 5:
-                    send_message(chat_id, "⚠️ Слишком мало сообщений за сегодня (меньше 5)")
+                if len(today_msgs) < 3:
+                    send_message(chat_id, "⚠️ Слишком мало сообщений за сегодня (меньше 3)")
                     return 'OK', 200
 
-                # ===== УМНОЕ КЭШИРОВАНИЕ =====
+                # Проверяем кэш
                 last_msg_id = today_msgs[-1]['message_id']
                 cached = digest_cache.get(chat_id)
 
-                # Если есть кэш и он за сегодня
                 if cached and cached['date'] == today:
-                    # Находим новые сообщения (после последнего обработанного)
+                    # Есть кэш - проверяем новые сообщения
                     new_msgs = [m for m in today_msgs if m['message_id'] > cached['last_msg_id']]
 
                     if not new_msgs:
-                        # Нет новых сообщений - возвращаем кэш
-                        send_message(chat_id, cached['digest'] + "\n\n_⚡ из кэша (нет новых сообщений)_")
+                        send_message(chat_id, cached['digest'] + "\n\n_⚡ из кэша_")
                         return 'OK', 200
 
-                    # Есть новые сообщения - обновляем дайджест
+                    # Обновляем дайджест с новыми сообщениями
                     new_text = "\n".join([f"{m['user_name']}: {m['text']}" for m in new_msgs])
 
                     prompt = f"""У меня есть текущий дайджест дня. Обнови его с учетом новых сообщений.
@@ -195,25 +205,25 @@ def webhook():
 Новые сообщения:
 {new_text}
 
-Верни ОБНОВЛЕННУЮ версию в ТОЧНО таком же формате:
+Верни ТОЛЬКО обновленный JSON:
 {{
-    "summary": "общее резюме дня (3-5 предложений)",
+    "summary": "общее резюме дня",
     "topics": [
         {{
-            "topic": "название темы",
-            "participants": ["Имя1", "Имя2"],
-            "key_points": "основные мысли по теме"
+            "topic": "тема",
+            "participants": ["Имя"],
+            "key_points": "основные мысли"
         }}
     ]
 }}"""
 
-                    system = "Ты аналитик чатов. Обновляй существующий дайджест, добавляя новые темы."
+                    system = "Ты аналитик чатов. Обновляй существующий дайджест."
 
                 else:
                     # Нет кэша - генерируем с нуля
                     messages_text = "\n".join([
                         f"{msg['user_name']}: {msg['text']}"
-                        for msg in today_msgs[-50:]
+                        for msg in today_msgs[-30:]  # Последние 30 сообщений
                     ])
 
                     prompt = f"""Проанализируй сообщения из чата за сегодня.
@@ -223,19 +233,24 @@ def webhook():
 
 Верни ТОЛЬКО JSON:
 {{
-    "summary": "общее резюме дня (3-5 предложений)",
+    "summary": "общее резюме дня",
     "topics": [
         {{
-            "topic": "название темы",
+            "topic": "тема 1",
             "participants": ["Имя1", "Имя2"],
             "key_points": "основные мысли по теме"
+        }},
+        {{
+            "topic": "тема 2",
+            "participants": ["Имя3"],
+            "key_points": "основные мысли"
         }}
     ]
 }}"""
 
                     system = "Ты аналитик чатов. Отвечай строго в JSON формате."
 
-                # Вызываем бесплатный AI
+                # Вызываем AI
                 response_content = call_free_ai(prompt, system)
 
                 if not response_content:
@@ -246,16 +261,16 @@ def webhook():
                 result = parse_json_response(response_content)
 
                 if not result:
-                    send_message(chat_id, f"❌ Ошибка при обработке ответа AI. Попробуй позже.\n\nОтвет: {response_content[:200]}...")
+                    send_message(chat_id, "❌ Ошибка при обработке ответа AI. Попробуй позже.")
                     return 'OK', 200
 
                 # Форматируем ответ
                 digest = f"📅 **Дайджест за {today.strftime('%d.%m.%Y')}**\n\n"
                 digest += f"📝 **Резюме:**\n{result.get('summary', 'Нет резюме')}\n\n"
-                digest += "🔍 **Ключевые темы:**\n"
+                digest += "🔍 **Темы:**\n"
 
                 for i, topic in enumerate(result.get('topics', []), 1):
-                    digest += f"\n{i}. **{topic.get('topic', 'Без темы')}**\n"
+                    digest += f"\n{i}. **{topic.get('topic', 'Тема')}**\n"
                     digest += f"   👥 Участники: {', '.join(topic.get('participants', ['-']))}\n"
                     digest += f"   💭 {topic.get('key_points', '')}\n"
 
@@ -270,9 +285,6 @@ def webhook():
 
                 send_message(chat_id, digest)
 
-            elif text.startswith('/'):
-                send_message(chat_id, "❌ Неизвестная команда. Напиши /help")
-
         return 'OK', 200
 
     except Exception as e:
@@ -285,10 +297,10 @@ def health():
 
 @app.route('/')
 def home():
-    return 'Bot is running with FREE AI!', 200
+    return 'Bot is running with Liquid LFM 2.5 (free AI)!', 200
 
-# Функция для установки вебхука
 def set_webhook():
+    """Установка вебхука"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     webhook_url = "https://monitorchatbot.onrender.com/"
     response = requests.post(url, json={'url': webhook_url})
@@ -298,12 +310,10 @@ def set_webhook():
         print(f"❌ Ошибка установки вебхука: {response.json()}")
 
 if __name__ == "__main__":
-    print("🚀 MonitorChatBot с БЕСПЛАТНЫМ AI и кэшем запускается...")
-    print("🤖 AI: OpenRouter (бесплатные модели DeepSeek) [citation:6]")
+    print("🚀 MonitorChatBot с БЕСПЛАТНЫМ AI (Liquid LFM 2.5) запускается...")
+    print(f"🤖 Модель: {FREE_MODEL}")
 
-    # Устанавливаем вебхук
     set_webhook()
 
-    # Запускаем Flask сервер
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
