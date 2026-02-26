@@ -132,48 +132,56 @@ def webhook():
 
                 # Формируем текст для анализа
                 messages_text = "\n".join([
-                    f"[{msg['user_name']}]: {msg['text']}"
+                    f"{msg['user_name']}: {msg['text']}"
                     for msg in recent_msgs
                 ])
 
-                # Промпт для DeepSeek
-                prompt = f"""Проанализируй сообщения из чата за сегодня и сделай краткое резюме.
+                # Промпт для DeepSeek - УПРОЩЕННАЯ ВЕРСИЯ без response_format
+                prompt = f"""Проанализируй сообщения из чата за сегодня и сделай краткое резюме в формате JSON.
 
-                Твои задачи:
-                1. Выдели 3-5 ключевых тем обсуждения
-                2. Для каждой темы укажи, кто из участников участвовал
-                3. Напиши краткое общее резюме дня
+Сообщения:
+{messages_text}
 
-                Формат ответа (строго JSON):
-                {{
-                    "summary": "общее резюме дня (3-5 предложений)",
-                    "topics": [
-                        {{
-                            "topic": "название темы",
-                            "participants": ["Имя1", "Имя2"],
-                            "key_points": "основные мысли по теме"
-                        }}
-                    ]
-                }}
-
-                Сообщения:
-                {messages_text}
-                """
+Ответ должен быть ТОЛЬКО в таком JSON формате:
+{{
+    "summary": "общее резюме дня (3-5 предложений)",
+    "topics": [
+        {{
+            "topic": "название темы",
+            "participants": ["Имя1", "Имя2"],
+            "key_points": "основные мысли по теме"
+        }}
+    ]
+}}"""
 
                 try:
-                    # Запрос к DeepSeek
+                    # Упрощенный вызов API - убираем response_format
                     response = deepseek_client.chat.completions.create(
                         model="deepseek-chat",
                         messages=[
-                            {"role": "system", "content": "Ты аналитик чатов. Отвечай только в JSON формате."},
+                            {"role": "system", "content": "Ты аналитик чатов. Отвечай строго в JSON формате."},
                             {"role": "user", "content": prompt}
                         ],
                         temperature=0.7,
-                        max_tokens=1000,
-                        response_format={"type": "json_object"}
+                        max_tokens=1000
+                        # response_format УДАЛЕН - некоторые модели его не поддерживают
                     )
 
-                    result = json.loads(response.choices[0].message.content)
+                    # Получаем ответ и парсим JSON
+                    content = response.choices[0].message.content
+                    logger.info(f"Ответ DeepSeek: {content[:200]}...")  # Логируем начало ответа
+
+                    # Очищаем ответ от возможных markdown-оберток
+                    content = content.strip()
+                    if content.startswith('```json'):
+                        content = content[7:]
+                    if content.startswith('```'):
+                        content = content[3:]
+                    if content.endswith('```'):
+                        content = content[:-3]
+                    content = content.strip()
+
+                    result = json.loads(content)
 
                     # Форматируем ответ
                     digest = f"📅 **Дайджест за {today.strftime('%d.%m.%Y')}**\n\n"
@@ -189,8 +197,17 @@ def webhook():
 
                     send_message(chat_id, digest)
 
+                except json.JSONDecodeError as e:
+                    logger.error(f"Ошибка парсинга JSON: {e}, ответ: {content}")
+                    send_message(chat_id, "❌ Ошибка при обработке ответа AI. Попробуй позже.")
+
                 except Exception as e:
                     logger.error(f"Ошибка DeepSeek: {e}")
+                    # Добавляем детали ошибки для отладки
+                    error_details = str(e)
+                    if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                        error_details += f" | Response: {e.response.text}"
+                    logger.error(f"Детали ошибки: {error_details}")
                     send_message(chat_id, "❌ Ошибка при обращении к AI. Попробуй позже.")
 
             elif text.startswith('/'):
