@@ -15,22 +15,22 @@ logger = logging.getLogger(__name__)
 # Загружаем переменные окружения
 load_dotenv()
 
-API_ID = int(os.getenv('API_ID'))
-API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')  # Может быть пустым для бесплатного режима
 
-# Настройка DeepSeek клиента
-if DEEPSEEK_API_KEY:
-    deepseek_client = openai.OpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url="https://api.deepseek.com/v1"
-    )
-else:
-    deepseek_client = None
+# Настройка OpenRouter клиента (бесплатный)
+openrouter_client = openai.OpenAI(
+    api_key=OPENROUTER_API_KEY or "not-needed",  # OpenRouter позволяет без ключа для free моделей [citation:6]
+    base_url="https://openrouter.ai/api/v1",
+    default_headers={
+        "HTTP-Referer": "https://monitorchatbot.onrender.com",  # Твой сайт
+        "X-Title": "MonitorChatBot"  # Название проекта
+    }
+)
 
-# Хранилище сообщений
+# Хранилище сообщений и кэша дайджестов
 message_store = defaultdict(list)
+digest_cache = {}  # {chat_id: {"last_msg_id": int, "digest": str, "date": date}}
 
 # Функция для отправки ответов в Telegram
 def send_message(chat_id, text):
@@ -41,6 +41,43 @@ def send_message(chat_id, text):
         'parse_mode': 'Markdown'
     })
 
+# Функция для вызова OpenRouter с бесплатными моделями [citation:6]
+def call_free_ai(prompt, system_prompt="Ты полезный ассистент."):
+    try:
+        response = openrouter_client.chat.completions.create(
+            model="deepseek/deepseek-chat:free",  # Бесплатная модель
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1000
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Ошибка OpenRouter: {e}")
+        return None
+
+# Функция для парсинга JSON из ответа
+def parse_json_response(content):
+    if not content:
+        return None
+    try:
+        # Очищаем от markdown-оберток
+        content = content.strip()
+        if content.startswith('```json'):
+            content = content[7:]
+        elif content.startswith('```'):
+            content = content[3:]
+        if content.endswith('```'):
+            content = content[:-3]
+        content = content.strip()
+
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка парсинга JSON: {e}, контент: {content[:200]}")
+        return None
+
 # Создаем Flask приложение
 app = Flask(__name__)
 
@@ -49,7 +86,6 @@ def webhook():
     """Принимаем обновления от Telegram"""
     try:
         update = request.get_json()
-        logger.info(f"Получено обновление: {update}")
 
         if 'message' in update:
             msg = update['message']
@@ -58,9 +94,11 @@ def webhook():
             user = msg['from']
             user_name = user.get('first_name', '')
             username = user.get('username', '')
+            message_id = msg['message_id']  # Важно для кэша
 
             # Сохраняем сообщение
             msg_data = {
+                'message_id': message_id,
                 'user_name': user_name,
                 'username': username,
                 'text': text,
@@ -68,36 +106,46 @@ def webhook():
             }
             message_store[chat_id].append(msg_data)
 
-            # Ограничиваем размер хранилища
-            if len(message_store[chat_id]) > 1000:
-                message_store[chat_id] = message_store[chat_id][-1000:]
+            # Ограничиваем размер хранилища (последние 2000 сообщений)
+            if len(message_store[chat_id]) > 2000:
+                message_store[chat_id] = message_store[chat_id][-2000:]
 
             # Обрабатываем команды
             if text == '/start':
-                send_message(chat_id, "👋 Привет! Я MonitorChatBot — анализатор чатов с AI\n\nКоманды:\n/stats - статистика\n/digest - AI-дайджест за сегодня\n/help - помощь")
+                send_message(chat_id, "👋 Привет! Я MonitorChatBot с **бесплатным AI**\n\nКоманды:\n/stats - статистика\n/digest - умный дайджест за сегодня (с кэшем)\n/clearcache - сбросить кэш дайджеста\n/help - помощь")
 
             elif text == '/help':
                 help_text = """
-🤖 **MonitorChatBot — Команды**
+🤖 **MonitorChatBot — Бесплатный AI**
 
 • `/stats` - статистика по последним 100 сообщениям
-• `/digest` - **AI-дайджест** за сегодня (DeepSeek)
+• `/digest` - **умный дайджест** (кэшируется, обновляется только новыми сообщениями)
+• `/clearcache` - сбросить кэш дайджеста (если хочешь перегенерировать с нуля)
 • `/status` - статус бота
-• `/help` - это сообщение
+
+**AI:** OpenRouter (бесплатные модели DeepSeek)
+**Кэш:** дайджест хранится и обновляется только новыми сообщениями
                 """
                 send_message(chat_id, help_text)
 
             elif text == '/status':
                 today_count = len([m for m in message_store[chat_id] if m['date'].date() == date.today()])
-                status = f"📊 **Статус**\n• Сообщений сегодня: {today_count}\n• Всего сохранено: {len(message_store[chat_id])}\n• AI: {'✅' if deepseek_client else '❌'}"
+                cached = chat_id in digest_cache and digest_cache[chat_id]['date'] == date.today()
+                status = f"📊 **Статус**\n• Сообщений сегодня: {today_count}\n• Всего сохранено: {len(message_store[chat_id])}\n• Кэш дайджеста: {'✅' if cached else '❌'}\n• AI: бесплатный OpenRouter"
                 send_message(chat_id, status)
+
+            elif text == '/clearcache':
+                if chat_id in digest_cache:
+                    del digest_cache[chat_id]
+                    send_message(chat_id, "✅ Кэш дайджеста очищен")
+                else:
+                    send_message(chat_id, "❌ Кэша не было")
 
             elif text == '/stats':
                 recent = message_store[chat_id][-100:]
                 if not recent:
                     send_message(chat_id, "❌ Нет сообщений для анализа")
                 else:
-                    # Считаем статистику по пользователям
                     user_stats = defaultdict(int)
                     for m in recent:
                         user_stats[m['user_name']] += 1
@@ -111,15 +159,10 @@ def webhook():
                     send_message(chat_id, report)
 
             elif text == '/digest':
-                if not deepseek_client:
-                    send_message(chat_id, "❌ DeepSeek не подключен. Проверь API ключ")
-                    return 'OK', 200
-
                 # Отправляем "печатает..."
                 requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction",
                               json={'chat_id': chat_id, 'action': 'typing'})
 
-                # Получаем сегодняшние сообщения
                 today = date.today()
                 today_msgs = [m for m in message_store[chat_id] if m['date'].date() == today]
 
@@ -127,22 +170,32 @@ def webhook():
                     send_message(chat_id, "⚠️ Слишком мало сообщений за сегодня (меньше 5)")
                     return 'OK', 200
 
-                # Берем последние 50 сообщений
-                recent_msgs = today_msgs[-50:]
+                # ===== УМНОЕ КЭШИРОВАНИЕ =====
+                last_msg_id = today_msgs[-1]['message_id']
+                cached = digest_cache.get(chat_id)
 
-                # Формируем текст для анализа
-                messages_text = "\n".join([
-                    f"{msg['user_name']}: {msg['text']}"
-                    for msg in recent_msgs
-                ])
+                # Если есть кэш и он за сегодня
+                if cached and cached['date'] == today:
+                    # Находим новые сообщения (после последнего обработанного)
+                    new_msgs = [m for m in today_msgs if m['message_id'] > cached['last_msg_id']]
 
-                # Промпт для DeepSeek - УПРОЩЕННАЯ ВЕРСИЯ без response_format
-                prompt = f"""Проанализируй сообщения из чата за сегодня и сделай краткое резюме в формате JSON.
+                    if not new_msgs:
+                        # Нет новых сообщений - возвращаем кэш
+                        send_message(chat_id, cached['digest'] + "\n\n_⚡ из кэша (нет новых сообщений)_")
+                        return 'OK', 200
 
-Сообщения:
-{messages_text}
+                    # Есть новые сообщения - обновляем дайджест
+                    new_text = "\n".join([f"{m['user_name']}: {m['text']}" for m in new_msgs])
 
-Ответ должен быть ТОЛЬКО в таком JSON формате:
+                    prompt = f"""У меня есть текущий дайджест дня. Обнови его с учетом новых сообщений.
+
+Текущий дайджест:
+{cached['digest']}
+
+Новые сообщения:
+{new_text}
+
+Верни ОБНОВЛЕННУЮ версию в ТОЧНО таком же формате:
 {{
     "summary": "общее резюме дня (3-5 предложений)",
     "topics": [
@@ -154,61 +207,68 @@ def webhook():
     ]
 }}"""
 
-                try:
-                    # Упрощенный вызов API - убираем response_format
-                    response = deepseek_client.chat.completions.create(
-                        model="deepseek-chat",
-                        messages=[
-                            {"role": "system", "content": "Ты аналитик чатов. Отвечай строго в JSON формате."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        temperature=0.7,
-                        max_tokens=1000
-                        # response_format УДАЛЕН - некоторые модели его не поддерживают
-                    )
+                    system = "Ты аналитик чатов. Обновляй существующий дайджест, добавляя новые темы."
 
-                    # Получаем ответ и парсим JSON
-                    content = response.choices[0].message.content
-                    logger.info(f"Ответ DeepSeek: {content[:200]}...")  # Логируем начало ответа
+                else:
+                    # Нет кэша - генерируем с нуля
+                    messages_text = "\n".join([
+                        f"{msg['user_name']}: {msg['text']}"
+                        for msg in today_msgs[-50:]
+                    ])
 
-                    # Очищаем ответ от возможных markdown-оберток
-                    content = content.strip()
-                    if content.startswith('```json'):
-                        content = content[7:]
-                    if content.startswith('```'):
-                        content = content[3:]
-                    if content.endswith('```'):
-                        content = content[:-3]
-                    content = content.strip()
+                    prompt = f"""Проанализируй сообщения из чата за сегодня.
 
-                    result = json.loads(content)
+Сообщения:
+{messages_text}
 
-                    # Форматируем ответ
-                    digest = f"📅 **Дайджест за {today.strftime('%d.%m.%Y')}**\n\n"
-                    digest += f"📝 **Резюме:**\n{result['summary']}\n\n"
-                    digest += "🔍 **Ключевые темы:**\n"
+Верни ТОЛЬКО JSON:
+{{
+    "summary": "общее резюме дня (3-5 предложений)",
+    "topics": [
+        {{
+            "topic": "название темы",
+            "participants": ["Имя1", "Имя2"],
+            "key_points": "основные мысли по теме"
+        }}
+    ]
+}}"""
 
-                    for i, topic in enumerate(result.get('topics', []), 1):
-                        digest += f"\n{i}. **{topic['topic']}**\n"
-                        digest += f"   👥 Участники: {', '.join(topic.get('participants', ['-']))}\n"
-                        digest += f"   💭 {topic['key_points']}\n"
+                    system = "Ты аналитик чатов. Отвечай строго в JSON формате."
 
-                    digest += f"\n📊 Проанализировано сообщений: {len(recent_msgs)}"
+                # Вызываем бесплатный AI
+                response_content = call_free_ai(prompt, system)
 
-                    send_message(chat_id, digest)
-
-                except json.JSONDecodeError as e:
-                    logger.error(f"Ошибка парсинга JSON: {e}, ответ: {content}")
-                    send_message(chat_id, "❌ Ошибка при обработке ответа AI. Попробуй позже.")
-
-                except Exception as e:
-                    logger.error(f"Ошибка DeepSeek: {e}")
-                    # Добавляем детали ошибки для отладки
-                    error_details = str(e)
-                    if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                        error_details += f" | Response: {e.response.text}"
-                    logger.error(f"Детали ошибки: {error_details}")
+                if not response_content:
                     send_message(chat_id, "❌ Ошибка при обращении к AI. Попробуй позже.")
+                    return 'OK', 200
+
+                # Парсим JSON
+                result = parse_json_response(response_content)
+
+                if not result:
+                    send_message(chat_id, f"❌ Ошибка при обработке ответа AI. Попробуй позже.\n\nОтвет: {response_content[:200]}...")
+                    return 'OK', 200
+
+                # Форматируем ответ
+                digest = f"📅 **Дайджест за {today.strftime('%d.%m.%Y')}**\n\n"
+                digest += f"📝 **Резюме:**\n{result.get('summary', 'Нет резюме')}\n\n"
+                digest += "🔍 **Ключевые темы:**\n"
+
+                for i, topic in enumerate(result.get('topics', []), 1):
+                    digest += f"\n{i}. **{topic.get('topic', 'Без темы')}**\n"
+                    digest += f"   👥 Участники: {', '.join(topic.get('participants', ['-']))}\n"
+                    digest += f"   💭 {topic.get('key_points', '')}\n"
+
+                digest += f"\n📊 Проанализировано сообщений: {len(today_msgs)}"
+
+                # Сохраняем в кэш
+                digest_cache[chat_id] = {
+                    'last_msg_id': last_msg_id,
+                    'digest': digest,
+                    'date': today
+                }
+
+                send_message(chat_id, digest)
 
             elif text.startswith('/'):
                 send_message(chat_id, "❌ Неизвестная команда. Напиши /help")
@@ -221,12 +281,11 @@ def webhook():
 
 @app.route('/health')
 def health():
-    """Health check для Render"""
     return 'OK', 200
 
 @app.route('/')
 def home():
-    return 'Bot is running', 200
+    return 'Bot is running with FREE AI!', 200
 
 # Функция для установки вебхука
 def set_webhook():
@@ -239,8 +298,8 @@ def set_webhook():
         print(f"❌ Ошибка установки вебхука: {response.json()}")
 
 if __name__ == "__main__":
-    print("🚀 MonitorChatBot с DeepSeek запускается...")
-    print(f"🤖 DeepSeek: {'✅ подключен' if DEEPSEEK_API_KEY else '❌ НЕТ API КЛЮЧА DEEPSEEK!'}")
+    print("🚀 MonitorChatBot с БЕСПЛАТНЫМ AI и кэшем запускается...")
+    print("🤖 AI: OpenRouter (бесплатные модели DeepSeek) [citation:6]")
 
     # Устанавливаем вебхук
     set_webhook()
