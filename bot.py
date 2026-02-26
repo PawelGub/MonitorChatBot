@@ -187,96 +187,110 @@ def webhook():
                 cached = digest_cache.get(chat_id)
 
                 if cached and cached['date'] == today:
-                    # Есть кэш - проверяем новые сообщения
                     new_msgs = [m for m in today_msgs if m['message_id'] > cached['last_msg_id']]
 
                     if not new_msgs:
                         send_message(chat_id, cached['digest'] + "\n\n_⚡ из кэша_")
                         return 'OK', 200
 
-                    # Обновляем дайджест с новыми сообщениями
                     new_text = "\n".join([f"{m['user_name']}: {m['text']}" for m in new_msgs])
 
-                    prompt = f"""У меня есть текущий дайджест дня. Обнови его с учетом новых сообщений.
+                    # 👇 ОБНОВЛЕННЫЙ ПРОМПТ ДЛЯ ОБНОВЛЕНИЯ
+                    prompt = f"""Слушай, у нас тут чат. Вот текущий дайджест, а вот новые сообщения.
 
-Текущий дайджест:
+Текущий дайджест (может быть кривым):
 {cached['digest']}
 
-Новые сообщения:
+Новые сообщения (добавь их в дайджест):
 {new_text}
 
-Верни ТОЛЬКО обновленный JSON:
+Твоя задача - обновить дайджест. Правила:
+1. Указывай ТОЛЬКО реальные имена, которые есть в сообщениях. Никаких "Имя1", "Участник2" - только те, кто реально писал.
+2. Будь пассивно-агрессивным. Как будто тебя задолбали, но ты все равно делаешь свою работу.
+3. Если тема очевидна - напиши ее, если нет - так и скажи.
+
+Формат JSON (строго):
 {{
-    "summary": "общее резюме дня",
+    "summary": "общее резюме дня (язвительно, но по делу)",
     "topics": [
         {{
-            "topic": "тема",
-            "participants": ["Имя"],
-            "key_points": "основные мысли"
+            "topic": "название темы",
+            "participants": ["Имя1", "Имя2"],  # Только те, кто реально писал в этой теме
+            "key_points": "суть темы (саркастично)"
         }}
     ]
 }}"""
 
-                    system = "Ты аналитик чатов. Обновляй существующий дайджест."
+                    system = "Ты уставший аналитик чата. Отвечаешь пассивно-агрессивно, но честно. JSON только."
 
                 else:
-                    # Нет кэша - генерируем с нуля
                     messages_text = "\n".join([
                         f"{msg['user_name']}: {msg['text']}"
-                        for msg in today_msgs[-30:]  # Последние 30 сообщений
+                        for msg in today_msgs[-30:]
                     ])
 
-                    prompt = f"""Проанализируй сообщения из чата за сегодня.
+                    # 👇 ОБНОВЛЕННЫЙ ПРОМПТ ДЛЯ НОВОГО ДАЙДЖЕСТА
+                    prompt = f"""О, еще один день, еще один чат. Разбирай.
 
-Сообщения:
+Сообщения за сегодня:
 {messages_text}
 
-Верни ТОЛЬКО JSON:
+Правила:
+1. Указывай ТОЛЬКО реальные имена участников. Проверь, кто реально писал в каждой теме.
+2. Тон - пассивно-агрессивный. Как будто тебе платят копейки, но ты все равно работаешь.
+3. Если кто-то пишет чушь - отметь это в резюме.
+4. Никаких выдуманных участников. Если в теме писал только Павел - в participants только ["Pawel"].
+
+Формат JSON:
 {{
-    "summary": "общее резюме дня",
+    "summary": "общее резюме дня (с подколом)",
     "topics": [
         {{
-            "topic": "тема 1",
-            "participants": ["Имя1", "Имя2"],
-            "key_points": "основные мысли по теме"
-        }},
-        {{
-            "topic": "тема 2",
-            "participants": ["Имя3"],
-            "key_points": "основные мысли"
+            "topic": "о чем базарили",
+            "participants": ["Имя"],  # Только реальные имена
+            "key_points": "суть (саркастично)"
         }}
     ]
 }}"""
 
-                    system = "Ты аналитик чатов. Отвечай строго в JSON формате."
+                    system = "Ты ворчливый аналитик чата. JSON строго, имена только реальные."
 
-                # Вызываем AI
                 response_content = call_free_ai(prompt, system)
 
                 if not response_content:
                     send_message(chat_id, "❌ Ошибка при обращении к AI. Попробуй позже.")
                     return 'OK', 200
 
-                # Парсим JSON
                 result = parse_json_response(response_content)
 
                 if not result:
                     send_message(chat_id, "❌ Ошибка при обработке ответа AI. Попробуй позже.")
                     return 'OK', 200
 
-                # Форматируем ответ
+                # 👇 ФИЛЬТРУЕМ УЧАСТНИКОВ (на всякий случай)
+                # Собираем все реальные имена за сегодня
+                real_names = {msg['user_name'] for msg in today_msgs}
+
+                # Чистим topics от выдуманных участников
+                if 'topics' in result:
+                    for topic in result['topics']:
+                        if 'participants' in topic:
+                            # Оставляем только реальные имена
+                            topic['participants'] = [p for p in topic['participants'] if p in real_names]
+                            if not topic['participants']:
+                                topic['participants'] = ["неизвестно кто"]  # на всякий случай
+
                 digest = f"📅 **Дайджест за {today.strftime('%d.%m.%Y')}**\n\n"
                 digest += f"📝 **Резюме:**\n{result.get('summary', 'Нет резюме')}\n\n"
                 digest += "🔍 **Темы:**\n"
 
                 for i, topic in enumerate(result.get('topics', []), 1):
                     digest += f"\n{i}. **{topic.get('topic', 'Тема')}**\n"
-                    digest += f"   👥 Участники: {', '.join(topic.get('participants', ['-']))}\n"
+                    digest += f"   👥 Кто: {', '.join(topic.get('participants', ['-']))}\n"
                     digest += f"   💭 {topic.get('key_points', '')}\n"
 
                 digest += f"\n📊 Проанализировано сообщений: {len(today_msgs)}"
 
-                # Сохраняем в кэш
                 digest_cache[chat_id] = {
                     'last_msg_id': last_msg_id,
                     'digest': digest,
