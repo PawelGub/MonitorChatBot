@@ -7,9 +7,13 @@ from dotenv import load_dotenv
 import openai
 from flask import Flask, request
 import requests
+import traceback
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Загружаем переменные окружения
@@ -18,55 +22,81 @@ load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN не найден!")
+if not OPENROUTER_API_KEY:
+    logger.error("OPENROUTER_API_KEY не найден!")
+
 # Настройка OpenRouter клиента
-openrouter_client = openai.OpenAI(
-    api_key=OPENROUTER_API_KEY,
-    base_url="https://openrouter.ai/api/v1",
-    default_headers={
-        "HTTP-Referer": "https://monitorchatbot.onrender.com",
-        "X-Title": "MonitorChatBot"
-    }
-)
+try:
+    openrouter_client = openai.OpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+        default_headers={
+            "HTTP-Referer": "https://monitorchatbot.onrender.com",
+            "X-Title": "MonitorChatBot"
+        }
+    )
+    logger.info("OpenRouter клиент создан")
+except Exception as e:
+    logger.error(f"Ошибка создания OpenRouter клиента: {e}")
+    openrouter_client = None
 
 # Хранилище сообщений и кэша
-message_store = defaultdict(list)  # {chat_id: [msg1, msg2, ...]}
-digest_cache = {}  # {chat_id: {"last_msg_id": int, "digest": str, "date": date, "topics": []}}
+message_store = defaultdict(list)
+digest_cache = {}
 
-# 👇 Лучшая бесплатная модель
 FREE_MODEL = "arcee-ai/trinity-large-preview:free"
-MAX_MESSAGES = 5000  # Увеличиваем для 2 дней
-KEEP_DAYS = 2  # Храним 2 дня
+MAX_MESSAGES = 5000
+KEEP_DAYS = 2
 
 def clean_old_messages():
     """Удаляем сообщения старше KEEP_DAYS дней"""
-    cutoff = datetime.now() - timedelta(days=KEEP_DAYS)
-    for chat_id in list(message_store.keys()):
-        message_store[chat_id] = [msg for msg in message_store[chat_id] if msg['date'] > cutoff]
-        if not message_store[chat_id]:
-            del message_store[chat_id]
+    try:
+        cutoff = datetime.now() - timedelta(days=KEEP_DAYS)
+        for chat_id in list(message_store.keys()):
+            message_store[chat_id] = [msg for msg in message_store[chat_id] if msg['date'] > cutoff]
+            if not message_store[chat_id]:
+                del message_store[chat_id]
+    except Exception as e:
+        logger.error(f"Ошибка очистки сообщений: {e}")
 
 def send_message(chat_id, text, reply_to=None):
     """Отправка сообщения в Telegram"""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': chat_id,
-        'text': text,
-        'parse_mode': 'Markdown'
-    }
-    if reply_to:
-        payload['reply_to_message_id'] = reply_to
-    requests.post(url, json=payload)
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': chat_id,
+            'text': text,
+            'parse_mode': 'Markdown'
+        }
+        if reply_to:
+            payload['reply_to_message_id'] = reply_to
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            logger.error(f"Ошибка отправки сообщения: {response.text}")
+        return response
+    except Exception as e:
+        logger.error(f"Ошибка отправки сообщения: {e}")
+        return None
 
 def get_message_link(chat_id, message_id):
     """Создает ссылку на сообщение в Telegram"""
-    # Формат: https://t.me/c/123456789/100 (где 123456789 = chat_id без -100)
-    chat_id_str = str(chat_id)
-    if chat_id_str.startswith('-100'):
-        chat_id_str = chat_id_str[4:]  # Убираем -100 для супергрупп
-    return f"https://t.me/c/{chat_id_str}/{message_id}"
+    try:
+        chat_id_str = str(chat_id)
+        if chat_id_str.startswith('-100'):
+            chat_id_str = chat_id_str[4:]
+        return f"https://t.me/c/{chat_id_str}/{message_id}"
+    except Exception as e:
+        logger.error(f"Ошибка создания ссылки: {e}")
+        return ""
 
 def call_free_ai(prompt, system_prompt="Ты полезный ассистент."):
     """Вызов бесплатной AI модели"""
+    if not openrouter_client:
+        logger.error("OpenRouter клиент не инициализирован")
+        return None
+
     try:
         response = openrouter_client.chat.completions.create(
             model=FREE_MODEL,
@@ -75,7 +105,8 @@ def call_free_ai(prompt, system_prompt="Ты полезный ассистент
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_tokens=1500
+            max_tokens=1500,
+            timeout=30
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -98,6 +129,7 @@ def parse_json_response(content):
         return json.loads(content)
     except json.JSONDecodeError as e:
         logger.error(f"Ошибка парсинга JSON: {e}")
+        logger.error(f"Контент: {content[:500]}")
         return None
 
 # Flask приложение
@@ -108,17 +140,21 @@ def webhook():
     """Обработчик вебхука"""
     try:
         update = request.get_json()
+        logger.info(f"Получен вебхук: {update.get('message', {}).get('text', '')[:50] if update else 'empty'}")
 
-        if 'message' in update:
-            msg = update['message']
-            chat_id = msg['chat']['id']
-            text = msg.get('text', '')
-            user = msg['from']
-            user_name = user.get('first_name', '')
-            username = user.get('username', '')
-            message_id = msg['message_id']
+        if not update or 'message' not in update:
+            return 'OK', 200
 
-            # Сохраняем сообщение
+        msg = update['message']
+        chat_id = msg['chat']['id']
+        text = msg.get('text', '')
+        user = msg.get('from', {})
+        user_name = user.get('first_name', 'Unknown')
+        username = user.get('username', '')
+        message_id = msg.get('message_id', 0)
+
+        # Сохраняем сообщение (только текстовые)
+        if text:
             msg_data = {
                 'message_id': message_id,
                 'user_name': user_name,
@@ -127,14 +163,18 @@ def webhook():
                 'date': datetime.now()
             }
             message_store[chat_id].append(msg_data)
+            logger.info(f"[{chat_id}] {user_name}: {text[:50]}")
 
-            # Очищаем старые сообщения
-            clean_old_messages()
+        # Очищаем старые сообщения
+        clean_old_messages()
 
-            if len(message_store[chat_id]) > MAX_MESSAGES:
-                message_store[chat_id] = message_store[chat_id][-MAX_MESSAGES:]
+        if len(message_store[chat_id]) > MAX_MESSAGES:
+            message_store[chat_id] = message_store[chat_id][-MAX_MESSAGES:]
 
-            # Обработка команд
+        # Обработка команд
+        if text.startswith('/'):
+            logger.info(f"Команда: {text}")
+
             if text == '/start':
                 send_message(chat_id, "👋 Привет! Я **MonitorChatBot** — анализатор чатов с AI\n\n"
                                       "**Команды:**\n"
@@ -148,7 +188,7 @@ def webhook():
 🤖 **MonitorChatBot — Команды**
 
 • `/stats` - статистика по последним 100 сообщениям
-• `/digest` - **расширенный дайджест** за последние 2 дня с ссылками на сообщения
+• `/digest` - **расширенный дайджест** за последние 2 дня с ссылками
 • `/clearcache` - сбросить кэш дайджеста
 • `/status` - статус бота
 
@@ -161,7 +201,7 @@ def webhook():
                 today_count = len([m for m in message_store[chat_id] if m['date'].date() == date.today()])
                 two_days_ago = date.today() - timedelta(days=KEEP_DAYS)
                 two_day_count = len([m for m in message_store[chat_id] if m['date'].date() >= two_days_ago])
-                cached = chat_id in digest_cache and digest_cache[chat_id]['date'] == date.today()
+                cached = chat_id in digest_cache and digest_cache[chat_id].get('date') == date.today()
                 status = f"📊 **Статус**\n" \
                          f"• Сообщений сегодня: {today_count}\n" \
                          f"• За {KEEP_DAYS} дня: {two_day_count}\n" \
@@ -195,92 +235,40 @@ def webhook():
                     send_message(chat_id, report)
 
             elif text == '/digest':
-                # Отправляем "печатает..."
-                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction",
-                              json={'chat_id': chat_id, 'action': 'typing'})
+                try:
+                    # Отправляем "печатает..."
+                    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendChatAction",
+                                  json={'chat_id': chat_id, 'action': 'typing'}, timeout=5)
 
-                # Берем сообщения за последние 2 дня
-                cutoff_date = date.today() - timedelta(days=KEEP_DAYS)
-                relevant_msgs = [m for m in message_store[chat_id] if m['date'].date() >= cutoff_date]
+                    # Берем сообщения за последние 2 дня
+                    cutoff_date = date.today() - timedelta(days=KEEP_DAYS)
+                    relevant_msgs = [m for m in message_store[chat_id] if m['date'].date() >= cutoff_date]
 
-                if len(relevant_msgs) < 3:
-                    send_message(chat_id, f"⚠️ Слишком мало сообщений за последние {KEEP_DAYS} дня (меньше 3)")
-                    return 'OK', 200
-
-                last_msg_id = relevant_msgs[-1]['message_id']
-                cached = digest_cache.get(chat_id)
-                real_names = {msg['user_name'] for msg in relevant_msgs}
-                names_list = ', '.join(real_names)
-
-                # Собираем сообщения с ID для ссылок
-                messages_with_ids = []
-                for msg in relevant_msgs:
-                    link = get_message_link(chat_id, msg['message_id'])
-                    messages_with_ids.append({
-                        'id': msg['message_id'],
-                        'user': msg['user_name'],
-                        'text': msg['text'],
-                        'date': msg['date'].strftime("%H:%M"),
-                        'link': link
-                    })
-
-                if cached and cached['date'] >= cutoff_date:
-                    # Есть кэш - обновляем
-                    new_msgs = [m for m in relevant_msgs if m['message_id'] > cached['last_msg_id']]
-
-                    if not new_msgs:
-                        send_message(chat_id, cached['digest'] + "\n\n_⚡ из кэша_")
+                    if len(relevant_msgs) < 3:
+                        send_message(chat_id, f"⚠️ Слишком мало сообщений за последние {KEEP_DAYS} дня (меньше 3)")
                         return 'OK', 200
 
-                    # Формируем текст для обновления
-                    new_text = "\n".join([
-                        f"[{m['user_name']}]({get_message_link(chat_id, m['message_id'])}): {m['text']}"
-                        for m in new_msgs
-                    ])
+                    last_msg_id = relevant_msgs[-1]['message_id']
 
-                    prompt = f"""Обнови существующий дайджест чата за последние {KEEP_DAYS} дня.
+                    # Формируем сообщения для AI
+                    messages_with_ids = []
+                    for msg in relevant_msgs[-60:]:  # Последние 60 сообщений
+                        link = get_message_link(chat_id, msg['message_id'])
+                        messages_with_ids.append({
+                            'id': msg['message_id'],
+                            'user': msg['user_name'],
+                            'text': msg['text'],
+                            'time': msg['date'].strftime("%H:%M"),
+                            'link': link
+                        })
 
-Участники: {names_list}
+                    real_names = {msg['user_name'] for msg in relevant_msgs}
+                    names_list = ', '.join(real_names)
 
-Текущий дайджест (может быть неполным):
-{cached['digest']}
-
-Новые сообщения (с ссылками):
-{new_text}
-
-Верни ОБНОВЛЕННЫЙ JSON в формате:
-{{
-    "summary": "общее резюме за период (что обсуждали, какое настроение)",
-    "timeline": [
-        {{
-            "topic": "название темы/разговора",
-            "start_message_link": "ссылка на первое сообщение темы",
-            "participants": ["Имя1", "Имя2"],
-            "summary": "краткое содержание обсуждения",
-            "key_messages": [
-                {{
-                    "text": "ключевая цитата",
-                    "author": "Имя",
-                    "link": "ссылка на сообщение"
-                }}
-            ]
-        }}
-    ]
-}}
-
-Правила:
-- start_message_link — это ссылка на сообщение, с которого началась тема
-- В key_messages добавь 1-3 самых важных сообщения по теме
-- Участники ТОЛЬКО из списка: {names_list}
-- Если в новых сообщениях нет новых тем, просто обнови существующие"""
-
-                    system = "Ты аналитик чата. Обновляй дайджест, добавляя ссылки."
-
-                else:
-                    # Нет кэша - генерируем с нуля
+                    # Формируем текст для AI
                     messages_text = "\n".join([
-                        f"[{msg['user_name']}]({msg['link']}): {msg['text']}"
-                        for msg in messages_with_ids[-60:]  # Последние 60 сообщений
+                        f"[{msg['user']}]({msg['link']}) [{msg['time']}]: {msg['text'][:200]}"
+                        for msg in messages_with_ids
                     ])
 
                     prompt = f"""Проанализируй сообщения в чате за последние {KEEP_DAYS} дня.
@@ -292,13 +280,13 @@ def webhook():
 
 Верни JSON:
 {{
-    "summary": "общее резюме за период (что обсуждали, ключевые темы, настроение)",
+    "summary": "общее резюме за период (что обсуждали, ключевые темы)",
     "timeline": [
         {{
             "topic": "название темы/разговора",
             "start_message_link": "ссылка на первое сообщение темы",
             "participants": ["Имя1", "Имя2"],
-            "summary": "подробное содержание обсуждения (2-3 предложения)",
+            "summary": "содержание обсуждения",
             "key_messages": [
                 {{
                     "text": "ключевая цитата",
@@ -311,74 +299,83 @@ def webhook():
 }}
 
 Правила:
-- start_message_link — скопируй ссылку из первого сообщения по теме
-- Каждая тема — это отдельная ветка обсуждения
+- start_message_link — скопируй ссылку из первого сообщения темы
 - Участники ТОЛЬКО из списка: {names_list}
-- Будь максимально подробным, структурируй по темам
-- Если тема переписки длинная — выдели ключевые моменты"""
+- Не выдумывай участников, только реальные"""
 
-                    system = "Ты аналитик чата. Отвечай JSON. Будь максимально подробным."
+                    system = "Ты аналитик чата. Отвечай JSON. Только реальные имена."
 
-                response_content = call_free_ai(prompt, system)
+                    # Вызываем AI
+                    response_content = call_free_ai(prompt, system)
 
-                if not response_content:
-                    send_message(chat_id, "❌ Ошибка при обращении к AI. Попробуй позже.")
-                    return 'OK', 200
+                    if not response_content:
+                        send_message(chat_id, "❌ Ошибка при обращении к AI. Попробуй позже.")
+                        return 'OK', 200
 
-                result = parse_json_response(response_content)
+                    result = parse_json_response(response_content)
 
-                if not result:
-                    send_message(chat_id, "❌ Ошибка при обработке ответа AI. Попробуй позже.")
-                    return 'OK', 200
+                    if not result:
+                        send_message(chat_id, "❌ Ошибка при обработке ответа AI. Попробуй позже.")
+                        return 'OK', 200
 
-                # Форматируем расширенный дайджест
-                start_date = cutoff_date.strftime('%d.%m.%Y')
-                end_date = date.today().strftime('%d.%m.%Y')
-                date_range = f"{start_date} — {end_date}" if start_date != end_date else start_date
+                    # Форматируем дайджест
+                    start_date = cutoff_date.strftime('%d.%m.%Y')
+                    end_date = date.today().strftime('%d.%m.%Y')
+                    date_range = f"{start_date} — {end_date}" if start_date != end_date else start_date
 
-                digest = f"📅 **Дайджест за {date_range}**\n\n"
-                digest += f"📝 **Резюме:**\n{result.get('summary', 'Нет резюме')}\n\n"
-                digest += "📌 **История обсуждений:**\n"
+                    digest = f"📅 **Дайджест за {date_range}**\n\n"
+                    digest += f"📝 **Резюме:**\n{result.get('summary', 'Нет резюме')[:500]}\n\n"
+                    digest += "📌 **Обсуждения:**\n"
 
-                for i, topic in enumerate(result.get('timeline', []), 1):
-                    digest += f"\n**{i}. {topic.get('topic', 'Тема')}**\n"
+                    for i, topic in enumerate(result.get('timeline', [])[:5], 1):
+                        digest += f"\n**{i}. {topic.get('topic', 'Тема')[:50]}**\n"
 
-                    # Ссылка на начало обсуждения
-                    start_link = topic.get('start_message_link', '')
-                    if start_link:
-                        digest += f"   🔗 [Начало обсуждения]({start_link})\n"
+                        start_link = topic.get('start_message_link', '')
+                        if start_link:
+                            digest += f"   🔗 [Начало]({start_link})\n"
 
-                    digest += f"   👥 Участники: {', '.join(topic.get('participants', ['-']))}\n"
-                    digest += f"   📖 {topic.get('summary', '')}\n"
+                        participants = topic.get('participants', [])
+                        if participants:
+                            digest += f"   👥 {', '.join(participants[:5])}\n"
 
-                    # Ключевые сообщения
-                    key_msgs = topic.get('key_messages', [])
-                    if key_msgs:
-                        digest += f"   💬 **Ключевые моменты:**\n"
-                        for km in key_msgs[:3]:
-                            text = km.get('text', '')[:80]
-                            author = km.get('author', '')
-                            link = km.get('link', '')
-                            if link:
-                                digest += f"      • [{author}]({link}): {text}\n"
-                            else:
-                                digest += f"      • {author}: {text}\n"
+                        summary = topic.get('summary', '')[:150]
+                        if summary:
+                            digest += f"   📖 {summary}\n"
 
-                digest += f"\n📊 Проанализировано сообщений: {len(relevant_msgs)}"
-                digest += f"\n📆 Период: {date_range}"
+                        key_msgs = topic.get('key_messages', [])
+                        if key_msgs:
+                            digest += f"   💬 **Цитаты:**\n"
+                            for km in key_msgs[:2]:
+                                text = km.get('text', '')[:80]
+                                author = km.get('author', '')
+                                link = km.get('link', '')
+                                if link:
+                                    digest += f"      • [{author}]({link}): {text}\n"
+                                else:
+                                    digest += f"      • {author}: {text}\n"
 
-                digest_cache[chat_id] = {
-                    'last_msg_id': last_msg_id,
-                    'digest': digest,
-                    'date': date.today()
-                }
+                    digest += f"\n📊 Сообщений: {len(relevant_msgs)}"
 
-                send_message(chat_id, digest)
+                    # Сохраняем кэш
+                    digest_cache[chat_id] = {
+                        'last_msg_id': last_msg_id,
+                        'digest': digest,
+                        'date': date.today()
+                    }
+
+                    send_message(chat_id, digest)
+
+                except Exception as e:
+                    logger.error(f"Ошибка в /digest: {traceback.format_exc()}")
+                    send_message(chat_id, f"❌ Ошибка: {str(e)[:100]}")
+
+            elif text.startswith('/'):
+                send_message(chat_id, "❌ Неизвестная команда. Напиши /help")
 
         return 'OK', 200
 
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
+        logger.error(f"Общая ошибка: {traceback.format_exc()}")
         return 'OK', 200
 
 @app.route('/health')
@@ -387,21 +384,27 @@ def health():
 
 @app.route('/')
 def home():
-    return f'Bot is running with {FREE_MODEL}! Stores {KEEP_DAYS} days of messages.', 200
+    return f'Bot is running with {FREE_MODEL}! Stores {KEEP_DAYS} days.', 200
 
 def set_webhook():
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-    webhook_url = "https://monitorchatbot.onrender.com/"
-    response = requests.post(url, json={'url': webhook_url})
-    if response.json().get('ok'):
-        print(f"✅ Вебхук установлен на {webhook_url}")
-    else:
-        print(f"❌ Ошибка установки вебхука: {response.json()}")
+    """Установка вебхука"""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+        webhook_url = "https://monitorchatbot.onrender.com/"
+        response = requests.post(url, json={'url': webhook_url}, timeout=10)
+        if response.status_code == 200 and response.json().get('ok'):
+            print(f"✅ Вебхук установлен на {webhook_url}")
+        else:
+            print(f"❌ Ошибка установки вебхука: {response.text}")
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
 
 if __name__ == "__main__":
-    print(f"🚀 MonitorChatBot с БЕСПЛАТНЫМ AI ({FREE_MODEL}) запускается...")
+    print(f"🚀 MonitorChatBot с {FREE_MODEL} запускается...")
     print(f"📆 Храним сообщения: {KEEP_DAYS} дня")
-    print("🔗 Дайджест включает ссылки на сообщения")
+    print(f"🔗 Дайджест включает ссылки на сообщения")
+    print(f"🤖 DeepSeek API ключ: {'✅' if OPENROUTER_API_KEY else '❌'}")
+    print(f"🤖 BOT_TOKEN: {'✅' if BOT_TOKEN else '❌'}")
 
     set_webhook()
 
